@@ -28,7 +28,6 @@ _Static_assert((1 << LEVEL1_LOG_BLOCK_SIZE) == LEVEL1_BLOCK_SIZE,
 
 #define FP_FREE             0
 #define KEY_FREE            0ULL
-#define VALUE_FREE          0ULL
 #define LEVEL2_CHOICE1_MASK 0xff
 #define LEVEL2_CHOICE2_MASK 0xff00
 
@@ -275,13 +274,19 @@ get_level3_block(hash *h)
   return h->raw_block[LEVEL1_BLOCK] % LEVEL3_BLOCKS;
 }
 
-#define LOCK_MASK   1
-#define UNLOCK_MASK ~1
+#define LOCK_MASK        1
+#define UNLOCK_MASK      ~1
+#define LEVEL1_LOCK_SLOT 63
+
+const static __attribute__((aligned(64))) uint8_t broadcast_mask[64] = {
+  [0 ... LEVEL1_LOCK_SLOT - 1] = 0,
+  LOCK_MASK,
+};
 
 static inline void
-lock_block(fingerprint_t *sketch)
+level1_lock_block(fingerprint_t *sketch)
 {
-  fingerprint_t *lock_fp = &sketch[63];
+  fingerprint_t *lock_fp = &sketch[LEVEL1_LOCK_SLOT];
   while ((__atomic_fetch_or(lock_fp, LOCK_MASK, __ATOMIC_SEQ_CST) &
           LOCK_MASK) != 0) {
     _mm_pause();
@@ -289,9 +294,9 @@ lock_block(fingerprint_t *sketch)
 }
 
 static inline void
-unlock_block(fingerprint_t *sketch)
+level1_unlock_block(fingerprint_t *sketch)
 {
-  fingerprint_t *lock_fp = &sketch[63];
+  fingerprint_t *lock_fp = &sketch[LEVEL1_LOCK_SLOT];
   *lock_fp               = *lock_fp & UNLOCK_MASK;
 }
 
@@ -692,9 +697,7 @@ level1_insert_into_block(iceberg_table  *table,
   verbose_print_sketch(sketch, 64);
   verbose_print_mask_64(match_mask);
 
-  uint8_t popcnt = __builtin_popcountll(match_mask);
-
-  if (unlikely(!popcnt)) {
+  if (unlikely(match_mask == 0)) {
     return false;
   }
 
@@ -703,8 +706,10 @@ level1_insert_into_block(iceberg_table  *table,
   verbose_print_location(1, pb.partition, pb.block, slot, kv);
   atomic_write_128(key, value, kv);
   fingerprint_t fp = h->fingerprint;
-  if (slot == 63) {
-    fp |= 1;
+
+  // Keep the lock on the block
+  if (slot == LEVEL1_LOCK_SLOT) {
+    fp |= LOCK_MASK;
   }
   sketch[slot] = h->fingerprint;
   verbose_print_sketch(sketch, 64);
@@ -720,7 +725,7 @@ delete_from_slot(iceberg_table *table,
                  level_type     lvl,
                  uint64_t       tid)
 {
-  atomic_write_128(KEY_FREE, VALUE_FREE, kv);
+  kv->key = KEY_FREE;
   sketch[slot_num] = FP_FREE;
   counter_decrement(&table->num_items_per_level, lvl, tid);
 }
@@ -742,9 +747,11 @@ level1_move_block(iceberg_table *table, partition_block pb, uint64_t tid)
   assert(partition_block_is_valid(table, pb));
   verbose_print_move(pb.partition, pb.block);
 
-  partition_block new_block_pb = get_new_block(table, pb);
-  fingerprint_t  *sketch       = get_level1_sketch(table, pb);
-  lock_block(sketch);
+  partition_block new_pb     = get_new_block(table, pb);
+  fingerprint_t  *old_sketch = get_level1_sketch(table, pb);
+  level1_lock_block(old_sketch);
+  fingerprint_t *new_sketch = get_level1_sketch(table, new_pb);
+  level1_lock_block(new_sketch);
   for (uint64_t i = 0; i < LEVEL1_BLOCK_SIZE; i++) {
     kv_pair *kv = get_level1_kv_pair(table, pb, i);
     if (kv->key == KEY_FREE) {
@@ -754,14 +761,15 @@ level1_move_block(iceberg_table *table, partition_block pb, uint64_t tid)
     hash h = hash_key(table, &kv->key);
 
     partition_block key_pb = get_block(table, &h, LEVEL1_BLOCK);
-    if (level1_key_should_move(table, key_pb, new_block_pb)) {
+    if (level1_key_should_move(table, key_pb, new_pb)) {
       __attribute__((unused)) bool ret =
         level1_insert_into_block(table, kv->key, kv->val, &h, key_pb, tid);
       assert(ret);
-      delete_from_slot(table, kv, sketch, i, LEVEL1, tid);
+      delete_from_slot(table, kv, old_sketch, i, LEVEL1, tid);
     }
   }
-  unlock_block(sketch);
+  level1_unlock_block(new_sketch);
+  level1_unlock_block(old_sketch);
 
   verbose_end("MOVE", true);
   level1_decrement_resize_counter(table);
@@ -1042,14 +1050,11 @@ level2_maybe_move(iceberg_table *table, partition_block pb, uint64_t tid)
     return;
   }
 
+  uint64_t chunk_num = level2_block_to_chunk_num(table, pb);
   if (block_is_new(table, pb)) {
-    uint64_t chunk_num = level2_block_to_chunk_num(table, pb);
-    chunk_num          = level2_old_chunk_num(table, chunk_num);
-    level2_maybe_move_chunk(table, chunk_num, tid);
-  } else {
-    uint64_t chunk_num = level2_block_to_chunk_num(table, pb);
-    level2_maybe_move_chunk(table, chunk_num, tid);
+    chunk_num = level2_old_chunk_num(table, chunk_num);
   }
+  level2_maybe_move_chunk(table, chunk_num, tid);
 }
 
 static inline bool
@@ -1059,7 +1064,6 @@ level2_insert(iceberg_table  *table,
               hash           *h,
               uint64_t        tid)
 {
-
   partition_block pb1     = get_block(table, h, LEVEL2_BLOCK1);
   fingerprint_t  *sketch1 = get_level2_sketch(table, pb1);
   verbose_print_sketch(sketch1, LEVEL2_BLOCK_SIZE);
@@ -1137,7 +1141,7 @@ iceberg_insert(iceberg_table  *table,
   level1_maybe_move(table, pb, tid);
 
   fingerprint_t *sketch = get_level1_sketch(table, pb);
-  lock_block(sketch);
+  level1_lock_block(sketch);
   verbose_print_sketch(sketch, 64);
 
   iceberg_value_t v;
@@ -1162,7 +1166,7 @@ iceberg_insert(iceberg_table  *table,
 
 out:
   verbose_end("INSERT", false);
-  unlock_block(sketch);
+  level1_unlock_block(sketch);
   return ret;
 }
 
@@ -1254,7 +1258,7 @@ iceberg_delete(iceberg_table *table, iceberg_key_t key, uint64_t tid)
   level1_maybe_move(table, pb, tid);
 
   fingerprint_t *sketch = get_level1_sketch(table, pb);
-  lock_block(sketch);
+  level1_lock_block(sketch);
   verbose_print_sketch(sketch, 64);
   uint64_t match_mask = sketch_match_64(sketch, h.fingerprint);
   verbose_print_mask_64(match_mask);
@@ -1278,7 +1282,7 @@ iceberg_delete(iceberg_table *table, iceberg_key_t key, uint64_t tid)
   ret = level2_delete(table, key, &h, tid);
 
 unlock_out:
-  unlock_block(sketch);
+  level1_unlock_block(sketch);
   goto out;
 out:
   verbose_end("DELETE", false);
