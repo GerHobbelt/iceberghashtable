@@ -228,7 +228,9 @@ ycsb_load_run_randint(int                    index_type,
       for (int i = 0; i < num_thread; i++)
         thread_group[i].join();
 
+#ifdef ENABLE_RESIZE
       iceberg_end(&hashtable);
+#endif
       auto duration = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::system_clock::now() - starttime);
       printf("Throughput: load, %f ,ops/us\n",
@@ -277,7 +279,7 @@ ycsb_load_run_randint(int                    index_type,
               std::chrono::high_resolution_clock::now();
 #endif
             auto ret =
-              iceberg_get_value(tds[thread_id].ht, keys[i], &val, thread_id);
+              iceberg_query(tds[thread_id].ht, keys[i], &val, thread_id);
             if (val != keys[i]) {
               std::cout << "[ICEBERG] wrong key read: " << val
                         << " expected: " << keys[i] << " ret: " << ret
