@@ -36,12 +36,16 @@ CFLAGS = $(OPT) -Wall -march=native -pthread -Werror -Wfatal-errors $(HUGE) -DXX
 CPPFLAGS = $(OPT) -Wall -march=native -pthread -Werror -Wfatal-errors $(HUGE) -std=c++11
 INCLUDE = -I ./include -I ./src
 SOURCES = src/iceberg_table.c
-HEADERS = include/iceberg_table.h include/public_counter.h src/iceberg_precompute.h src/lock.h src/counter.h src/util.h src/verbose.h
+HEADERS = include/iceberg_table.h src/iceberg_precompute.h src/lock.h src/counter.h src/util.h src/verbose.h
 OBJECTS = $(subst src/,obj/,$(subst .c,.o,$(SOURCES)))
 
-all: micro ycsb
+all: test micro ycsb
 
 obj/iceberg_table.o: src/iceberg_table.c $(HEADERS)
+	@ mkdir -p obj
+	$(CC) $(CFLAGS) $(INCLUDE) -c $< -o $@
+
+obj/test.o: test.c obj/iceberg_table.o
 	@ mkdir -p obj
 	$(CC) $(CFLAGS) $(INCLUDE) -c $< -o $@
 
@@ -52,6 +56,9 @@ obj/micro.o: micro.cc obj/iceberg_table.o
 obj/ycsb.o: ycsb.cc obj/iceberg_table.o
 	@ mkdir -p obj
 	$(CPP) $(CPPFLAGS) $(INCLUDE) -c $< -o $@
+
+test: $(OBJECTS) obj/test.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LIBS)
 
 micro: $(OBJECTS) obj/micro.o
 	$(CPP) $(CFLAGS) $^ -o $@ $(LIBS)
@@ -68,4 +75,4 @@ clean:
 	rm -f micro ycsb $(OBJECTS) obj/micro.o obj/ycsb.o
 
 format:
-	clang-format-13 -style=file -i $(SOURCES) $(HEADERS)
+	clang-format-13 -style=file -i $(SOURCES) $(HEADERS) test.c micro.cc ycsb.cc
