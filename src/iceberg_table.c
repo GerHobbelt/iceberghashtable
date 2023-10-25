@@ -1073,16 +1073,10 @@ level2_insert(iceberg_table  *table,
     pb1     = pb2;
     sketch1 = sketch2;
     match_mask >>= 8;
-    popcnt1 = popcnt2;
   }
 
-
-  if (level2_insert_into_block_with_mask(
-        table, key, value, h, pb1, sketch1, match_mask, tid)) {
-    return true;
-  }
-
-  return level3_insert(table, key, value, h, tid);
+  return level2_insert_into_block_with_mask(
+    table, key, value, h, pb1, sketch1, match_mask, tid);
 }
 
 static inline bool iceberg_query_internal(iceberg_table   *table,
@@ -1142,17 +1136,23 @@ iceberg_insert(iceberg_table  *table,
 
   iceberg_value_t v;
   verbose_print_operation("INTERNAL QUERY:", key, value);
-  bool ret = true;
+  bool ret = false;
   if (unlikely(iceberg_query_internal(table, key, &v, &h, tid))) {
-    ret = true;
     goto out;
   }
   verbose_end("INTERNAL QUERY", true);
 
   ret = level1_insert_into_block(table, key, value, &h, pb, tid);
-  if (!ret) {
-    ret = level2_insert(table, key, value, &h, tid);
+  if (ret) {
+    goto out;
   }
+
+  ret = level2_insert(table, key, value, &h, tid);
+  if (ret) {
+    goto out;
+  }
+
+  ret = level3_insert(table, key, value, &h, tid);
 
 out:
   verbose_end("INSERT", false);
@@ -1362,23 +1362,23 @@ level2_query(iceberg_table   *table,
              hash            *h)
 {
   partition_block pb1 = get_block(table, h, LEVEL2_BLOCK1);
-  bool            ret = level2_maybe_query_old_block(table, key, value, h, pb1);
-  if (ret) {
-    return ret;
+  bool found          = level2_maybe_query_old_block(table, key, value, h, pb1);
+  if (found) {
+    return found;
   }
-  ret = level2_query_block(table, key, value, h, pb1);
-  if (ret) {
-    return ret;
+  found = level2_query_block(table, key, value, h, pb1);
+  if (found) {
+    return found;
   }
 
   partition_block pb2 = get_block(table, h, LEVEL2_BLOCK2);
-  ret                 = level2_maybe_query_old_block(table, key, value, h, pb1);
-  if (ret) {
-    return ret;
+  found               = level2_maybe_query_old_block(table, key, value, h, pb2);
+  if (found) {
+    return found;
   }
-  ret = level2_query_block(table, key, value, h, pb2);
-  if (ret) {
-    return ret;
+  found = level2_query_block(table, key, value, h, pb2);
+  if (found) {
+    return found;
   }
 
   return level3_query(table, key, value, h);
@@ -1433,17 +1433,20 @@ iceberg_query_internal(iceberg_table   *table,
 {
   partition_block pb = get_block(table, h, LEVEL1_BLOCK);
 
-  level1_maybe_query_old_block(table, key, value, h, pb);
-
-  bool ret = level1_query_block(table, key, value, h, pb);
-  if (ret) {
+  bool found = level1_maybe_query_old_block(table, key, value, h, pb);
+  if (found) {
     goto out;
   }
 
-  ret = level2_query(table, key, value, h);
+  found = level1_query_block(table, key, value, h, pb);
+  if (found) {
+    goto out;
+  }
+
+  found = level2_query(table, key, value, h);
 
 out:
-  return ret;
+  return found;
 }
 
 __attribute__((always_inline)) inline bool
