@@ -11,10 +11,11 @@
 #include <thread>
 #include <time.h>
 #include <tmmintrin.h>
+#ifndef _MSC_VER
 #include <unistd.h>
-
 #include <sys/resource.h>
 #include <sys/time.h>
+#endif
 
 using namespace std::chrono;
 
